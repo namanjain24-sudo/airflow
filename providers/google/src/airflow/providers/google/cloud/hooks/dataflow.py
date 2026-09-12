@@ -72,6 +72,8 @@ from airflow.providers.google.common.hooks.base_google import (
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from google.cloud.dataflow_v1beta3.services.jobs_v1_beta3.pagers import ListJobsAsyncPager
     from google.cloud.dataflow_v1beta3.services.messages_v1_beta3.pagers import ListJobMessagesAsyncPager
     from google.protobuf.timestamp_pb2 import Timestamp
@@ -461,6 +463,21 @@ class _DataflowJobsController(DataflowJobTerminalStateHelper):
         jobs = self._fetch_all_jobs()
         jobs = [job for job in jobs if job["name"].startswith(prefix_name)]
         return jobs
+
+    def fetch_latest_job_by_name(self, name: str) -> dict | None:
+        """
+        Fetch the most recently created job with the specified name.
+
+        Dataflow job names are not unique over time, so the job with the latest
+        ``createTime`` is returned.
+
+        :param name: Name of the job that needs to be fetched.
+        :return: Dictionary containing the Job's data, or None if no job has that name.
+        """
+        jobs = [job for job in self._fetch_all_jobs() if job["name"] == name]
+        if not jobs:
+            return None
+        return max(jobs, key=lambda job: job.get("createTime", ""))
 
     def _refresh_jobs(self) -> None:
         """
@@ -1174,6 +1191,33 @@ class DataflowHook(GoogleBaseHook):
         return jobs_controller.fetch_job_by_id(job_id)
 
     @GoogleBaseHook.fallback_to_default_project_id
+    def get_latest_job_by_name(
+        self,
+        job_name: str,
+        project_id: str = PROVIDE_PROJECT_ID,
+        location: str = DEFAULT_DATAFLOW_LOCATION,
+    ) -> dict | None:
+        """
+        Get the most recently created job with the specified name.
+
+        Dataflow job names are not unique over time, so the job with the latest
+        ``createTime`` is returned.
+
+        :param job_name: Name of the job to get.
+        :param project_id: Optional, the Google Cloud project ID in which to look for the job.
+            If set to None or missing, the default project_id from the Google Cloud connection is used.
+        :param location: The location of the Dataflow job (for example europe-west1). See:
+            https://cloud.google.com/dataflow/docs/concepts/regional-endpoints
+        :return: the Job, or None if no job has that name.
+        """
+        jobs_controller = _DataflowJobsController(
+            dataflow=self.get_conn(),
+            project_number=project_id,
+            location=location,
+        )
+        return jobs_controller.fetch_latest_job_by_name(job_name)
+
+    @GoogleBaseHook.fallback_to_default_project_id
     def fetch_job_metrics_by_id(
         self,
         job_id: str,
@@ -1548,6 +1592,31 @@ class AsyncDataflowHook(GoogleBaseAsyncHook, DataflowJobTerminalStateHelper):
         )
         page_result: ListJobsAsyncPager = await client.list_jobs(request=request)
         return page_result
+
+    async def get_latest_job_by_name(
+        self,
+        job_name: str,
+        project_id: str | None = PROVIDE_PROJECT_ID,
+        location: str | None = DEFAULT_DATAFLOW_LOCATION,
+    ) -> Job | None:
+        """
+        Get the most recently created job with the specified name.
+
+        Dataflow job names are not unique over time, so the job with the latest
+        ``create_time`` is returned.
+
+        :param job_name: Name of the job to get.
+        :param project_id: Optional. The Google Cloud project ID in which to look for the job.
+            If set to None or missing, the default project_id from the Google Cloud connection is used.
+        :param location: Optional. The location of the Dataflow job (for example europe-west1).
+        :return: the Job, or None if no job has that name.
+        """
+        jobs_pager = await self.list_jobs(project_id=project_id, location=location)
+        jobs = [job async for job in jobs_pager if job.name == job_name]
+        if not jobs:
+            return None
+        # proto-plus exposes a Timestamp field as a datetime subclass, which is orderable.
+        return max(jobs, key=lambda job: cast("datetime", job.create_time))
 
     async def list_job_messages(
         self,

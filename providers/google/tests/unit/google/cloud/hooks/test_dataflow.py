@@ -31,6 +31,7 @@ import pytest
 from google.cloud.dataflow_v1beta3 import (
     GetJobMetricsRequest,
     GetJobRequest,
+    Job,
     JobView,
     ListJobMessagesRequest,
     ListJobsRequest,
@@ -248,6 +249,24 @@ class TestDataflowHook:
             location=TEST_LOCATION,
         )
         method_fetch_job_by_id.assert_called_once_with(TEST_JOB_ID)
+
+    @mock.patch(DATAFLOW_STRING.format("_DataflowJobsController"))
+    @mock.patch(DATAFLOW_STRING.format("DataflowHook.get_conn"))
+    def test_get_latest_job_by_name(self, mock_conn, mock_dataflowjob):
+        method_fetch_latest_job_by_name = mock_dataflowjob.return_value.fetch_latest_job_by_name
+
+        result = self.dataflow_hook.get_latest_job_by_name(
+            job_name=JOB_NAME, project_id=TEST_PROJECT_ID, location=TEST_LOCATION
+        )
+
+        mock_conn.assert_called_once()
+        mock_dataflowjob.assert_called_once_with(
+            dataflow=mock_conn.return_value,
+            project_number=TEST_PROJECT_ID,
+            location=TEST_LOCATION,
+        )
+        method_fetch_latest_job_by_name.assert_called_once_with(JOB_NAME)
+        assert result == method_fetch_latest_job_by_name.return_value
 
     @mock.patch(DATAFLOW_STRING.format("_DataflowJobsController"))
     @mock.patch(DATAFLOW_STRING.format("DataflowHook.get_conn"))
@@ -1332,6 +1351,48 @@ class TestDataflowJob:
         result = jobs_controller._fetch_all_jobs()
         assert result == []
 
+    @mock.patch(DATAFLOW_STRING.format("_DataflowJobsController._fetch_all_jobs"))
+    def test_fetch_latest_job_by_name_returns_most_recently_created_job(self, mock_fetch_all_jobs):
+        older_job = {"id": "older-job-id", "name": JOB_NAME, "createTime": "2024-05-01T10:00:00.000Z"}
+        newest_job = {"id": "newest-job-id", "name": JOB_NAME, "createTime": "2024-05-03T10:00:00.000Z"}
+        other_job = {"id": "other-job-id", "name": "other-name", "createTime": "2024-05-04T10:00:00.000Z"}
+        mock_fetch_all_jobs.return_value = [older_job, newest_job, other_job]
+
+        jobs_controller = _DataflowJobsController(
+            dataflow=self.mock_dataflow,
+            project_number=TEST_PROJECT,
+            location=TEST_LOCATION,
+        )
+
+        assert jobs_controller.fetch_latest_job_by_name(JOB_NAME) == newest_job
+
+    @mock.patch(DATAFLOW_STRING.format("_DataflowJobsController._fetch_all_jobs"))
+    def test_fetch_latest_job_by_name_matches_name_exactly(self, mock_fetch_all_jobs):
+        """A job whose name only starts with the requested name must not be matched."""
+        mock_fetch_all_jobs.return_value = [
+            {"id": TEST_JOB_ID, "name": f"{JOB_NAME}-suffix", "createTime": "2024-05-01T10:00:00.000Z"}
+        ]
+
+        jobs_controller = _DataflowJobsController(
+            dataflow=self.mock_dataflow,
+            project_number=TEST_PROJECT,
+            location=TEST_LOCATION,
+        )
+
+        assert jobs_controller.fetch_latest_job_by_name(JOB_NAME) is None
+
+    @mock.patch(DATAFLOW_STRING.format("_DataflowJobsController._fetch_all_jobs"))
+    def test_fetch_latest_job_by_name_when_no_jobs_returned(self, mock_fetch_all_jobs):
+        mock_fetch_all_jobs.return_value = []
+
+        jobs_controller = _DataflowJobsController(
+            dataflow=self.mock_dataflow,
+            project_number=TEST_PROJECT,
+            location=TEST_LOCATION,
+        )
+
+        assert jobs_controller.fetch_latest_job_by_name(JOB_NAME) is None
+
     @mock.patch(DATAFLOW_STRING.format("_DataflowJobsController._fetch_list_job_messages_responses"))
     def test_fetch_job_messages_by_id(self, mock_fetch_responses):
         mock_fetch_responses.return_value = iter(
@@ -1684,6 +1745,12 @@ class TestDataflow:
         assert "dataflow-other-stderr" in warn_messages
 
 
+async def async_iterator(items):
+    """Wrap a list into an async iterator, as returned by the Dataflow list_jobs pager."""
+    for item in items:
+        yield item
+
+
 @pytest.fixture
 def make_mock_awaitable():
     def func(mock_obj, return_value):
@@ -1749,6 +1816,45 @@ class TestAsyncDataflowHook:
         )
         initialize_client_mock.assert_called_once()
         client.list_jobs.assert_called_once_with(request=request)
+
+    @pytest.mark.asyncio
+    @mock.patch(DATAFLOW_STRING.format("AsyncDataflowHook.list_jobs"))
+    async def test_get_latest_job_by_name(self, mock_list_jobs, hook):
+        older_job = Job(id="older-job-id", name=JOB_NAME, create_time={"seconds": 1000})
+        newest_job = Job(id="newest-job-id", name=JOB_NAME, create_time={"seconds": 2000})
+        other_job = Job(id="other-job-id", name="other-name", create_time={"seconds": 3000})
+        mock_list_jobs.return_value = async_iterator([older_job, newest_job, other_job])
+
+        result = await hook.get_latest_job_by_name(
+            job_name=JOB_NAME, project_id=TEST_PROJECT_ID, location=TEST_LOCATION
+        )
+
+        assert result == newest_job
+        mock_list_jobs.assert_called_once_with(project_id=TEST_PROJECT_ID, location=TEST_LOCATION)
+
+    @pytest.mark.asyncio
+    @mock.patch(DATAFLOW_STRING.format("AsyncDataflowHook.list_jobs"))
+    async def test_get_latest_job_by_name_matches_name_exactly(self, mock_list_jobs, hook):
+        """A job whose name only starts with the requested name must not be matched."""
+        job = Job(id=TEST_JOB_ID, name=f"{JOB_NAME}-suffix", create_time={"seconds": 1000})
+        mock_list_jobs.return_value = async_iterator([job])
+
+        result = await hook.get_latest_job_by_name(
+            job_name=JOB_NAME, project_id=TEST_PROJECT_ID, location=TEST_LOCATION
+        )
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    @mock.patch(DATAFLOW_STRING.format("AsyncDataflowHook.list_jobs"))
+    async def test_get_latest_job_by_name_when_no_jobs_returned(self, mock_list_jobs, hook):
+        mock_list_jobs.return_value = async_iterator([])
+
+        result = await hook.get_latest_job_by_name(
+            job_name=JOB_NAME, project_id=TEST_PROJECT_ID, location=TEST_LOCATION
+        )
+
+        assert result is None
 
     @pytest.mark.asyncio
     @mock.patch(DATAFLOW_STRING.format("AsyncDataflowHook.initialize_client"))
